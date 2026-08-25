@@ -58,6 +58,25 @@ Backpressure, bleiben Used-Cursor und Deskriptorbesitz unveraendert; DriverApi
 v23 plant eine weitere ereignisgesteuerte Aktivierung. Der periodische
 10-ms-Poll dient nur als Kompatibilitaetswatchdog.
 
+RX-Pruefsummenfaehigkeit seit 0.69.50
+-------------------------------------
+
+Wenn das Geraet `VIRTIO_NET_F_GUEST_CSUM` anbietet, handelt der Treiber dieses
+Transportmerkmal aus und bietet NetBackend v2 genau
+`rx_l4_checksum_valid` an. Erst die anschliessende DriverApi-v24-Abfrage der
+Kernelentscheidung aktiviert die Weitergabe. `DATA_VALID` wird als Metadatum
+mit dem kanonischen Flat-Frame an Netcore uebergeben. Netcore prueft Form,
+IPv4 und Fragmentierung erneut und setzt nur fuer passenden TCP-/UDP-RX-
+Dispatch das R4P-Flag.
+
+`NEEDS_CSUM` ist kein Validierungsnachweis: Der Treiber vervollstaendigt die
+vom Virtio-Header bezeichnete IPv4-TCP-/UDP-Pruefsumme und laesst NetUdp oder
+NetTcp sie danach normal in Software pruefen. Nicht ausgehandeltes
+`DATA_VALID`, unbekannte Flags und unpassende Paketformen nehmen denselben
+Flat-Fallback; nicht ausgehandeltes GSO wird abgewiesen. Statuszaehler weisen
+Angebot/Annahme, genutzte Validierungen, Softwarefallbacks und fehlerhafte
+Metadaten aus. RX-Ringbesitz und Backpressure-Semantik bleiben unveraendert.
+
 Abnahme-Harness:
 
     Tests/Gate/Run-VirtioNetDhcpLiveTest05636.ps1

@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.2`
+- Version: `0.1.3`
 - Image target: `/R4OS/DRIVERS/VIRTNET.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -17,6 +17,12 @@ Only a queue cause with pending RX entries publishes DriverApi v23 work;
 configuration-only and TX-only interrupts do not enter the RX protocol path.
 The `net-rx` task drains descriptors and retains the current used entry while
 the bounded common queue is full.
+
+NetBackend v2 offers RX L4 checksum validation only when the virtio device
+accepted `VIRTIO_NET_F_GUEST_CSUM`. DriverApi v24 confirms the selection.
+`DATA_VALID` is then propagated to NetUdp/NetTcp; `NEEDS_CSUM` is completed
+in place and still software-verified. Unknown or rejected metadata retains
+the canonical flat frame and all other offloads remain disabled.
 
 ## Build
 

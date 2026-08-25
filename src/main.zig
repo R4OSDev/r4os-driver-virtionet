@@ -12,6 +12,7 @@
 // GSI-16-23-Mitregistrierung, Poll-Fallback per OPTION VIRTNET irq=off).
 
 const r4os = @import("r4os");
+const checksum_policy = @import("checksum_policy.zig");
 const irq_policy = @import("irq_policy.zig");
 
 comptime {
@@ -57,6 +58,7 @@ const STATUS_FEATURES_OK: u8 = 8;
 // Feature-Bits: Wort 0 traegt die Netz-Features, Wort 1 die Transport-
 // Features (Bit 32 = VIRTIO_F_VERSION_1).
 const FEATURE_W0_NET_MAC: u32 = 1 << 5;
+const FEATURE_W0_NET_GUEST_CSUM: u32 = 1 << 1;
 const FEATURE_W0_NET_STATUS: u32 = 1 << 16;
 const FEATURE_W1_VERSION_1: u32 = 1 << 0;
 const NET_CONFIG_STATUS: u64 = 6;
@@ -103,6 +105,8 @@ const State = struct {
     adapter_index: i32 = -1,
     mac: [6]u8 = .{0} ** 6,
     link_status_feature: bool = false,
+    guest_checksum_feature: bool = false,
+    accepted_capabilities: u64 = 0,
 
     // Gemappte BAR-Regionen (Index = BAR-Nummer)
     bars: [6]r4os.abi.MmioRegion = @splat(.{}),
@@ -153,6 +157,10 @@ const State = struct {
     irq_config: u64 = 0,
     rx_handoff_busy: u64 = 0,
     rx_budget_ends: u64 = 0,
+    rx_offload_packets: u64 = 0,
+    rx_software_fallbacks: u64 = 0,
+    rx_partial_completions: u64 = 0,
+    rx_metadata_errors: u64 = 0,
 };
 
 const VirtioCap = struct {
@@ -223,6 +231,14 @@ export fn virtnet_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     backend.poll = poll;
     backend.shutdown = backendShutdown;
     backend.status = status;
+    backend.offered_capabilities = if (state.guest_checksum_feature) r4os.abi.net_backend_cap_rx_l4_checksum_valid else 0;
+    backend.required_capabilities = 0;
+    backend.rx_queue_count = 1;
+    backend.tx_queue_count = 1;
+    backend.max_rx_segments = 1;
+    backend.max_tx_segments = 1;
+    backend.rx_ownership = r4os.abi.net_buffer_ownership_borrowed_until_return;
+    backend.tx_ownership = r4os.abi.net_buffer_ownership_borrowed_until_return;
 
     const adapter = ctx.registerNetBackend("virtnet", &backend);
     if (adapter < 0) {
@@ -232,6 +248,17 @@ export fn virtnet_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     }
     state.adapter_index = adapter;
     state.registered = true;
+    var negotiated: r4os.abi.NetBackendNegotiation = .{};
+    if (ctx.netBackendQuery(adapter, &negotiated) != 0) {
+        // Registration already succeeded and NetBackend optional bits always
+        // have the v1 flat fallback. Keep the adapter alive without metadata.
+        ctx.logWarn("VIRTNET.R4D capability query failed, flat fallback");
+        negotiated = .{};
+    }
+    state.accepted_capabilities = negotiated.accepted;
+    if ((state.accepted_capabilities & r4os.abi.net_backend_cap_rx_l4_checksum_valid) != 0) {
+        ctx.logInfo("VIRTNET.R4D RX checksum capability negotiated");
+    }
     setupInterrupt(&ctx);
     ctx.logInfo("VIRTNET.R4D registered");
     return 0;
@@ -350,7 +377,10 @@ fn initDevice(ctx: *const r4os.r4dev.DriverContext) bool {
         return false;
     }
     state.link_status_feature = (feat0 & FEATURE_W0_NET_STATUS) != 0;
-    const driver_feat0 = FEATURE_W0_NET_MAC | if (state.link_status_feature) FEATURE_W0_NET_STATUS else 0;
+    state.guest_checksum_feature = (feat0 & FEATURE_W0_NET_GUEST_CSUM) != 0;
+    const driver_feat0 = FEATURE_W0_NET_MAC |
+        (if (state.link_status_feature) FEATURE_W0_NET_STATUS else 0) |
+        (if (state.guest_checksum_feature) FEATURE_W0_NET_GUEST_CSUM else 0);
     mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE_SELECT, 0);
     mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE, driver_feat0);
     mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE_SELECT, 1);
@@ -535,15 +565,63 @@ fn drainRx(s: *State) bool {
         const total_len = ramRead32(elem_off + 4);
         if (id < RX_RING and total_len > NET_HDR_LEN) {
             const frame_len: usize = @min(@as(usize, total_len) - NET_HDR_LEN, RX_BUF_SIZE - NET_HDR_LEN);
-            const data: [*]const u8 = @ptrFromInt(s.dma.virt_addr + OFF_RX_BUF + @as(u64, @intCast(id)) * RX_BUF_SIZE + NET_HDR_LEN);
-            const handoff_result = ctx.netReceiveFrame(s.adapter_index, data[0..frame_len]);
+            const rx_buffer: [*]u8 = @ptrFromInt(s.dma.virt_addr + OFF_RX_BUF + @as(u64, @intCast(id)) * RX_BUF_SIZE);
+            const data = rx_buffer[NET_HDR_LEN .. NET_HDR_LEN + frame_len];
+            const virtio_flags = rx_buffer[0];
+            const decision = checksum_policy.decide(
+                virtio_flags,
+                rx_buffer[1],
+                (s.accepted_capabilities & r4os.abi.net_backend_cap_rx_l4_checksum_valid) != 0,
+            );
+            var packet_flags: u64 = 0;
+            if ((virtio_flags & checksum_policy.flag_data_valid) != 0 and
+                (virtio_flags & checksum_policy.flag_needs_checksum) == 0)
+            {
+                packet_flags |= r4os.abi.net_packet_flag_rx_l4_checksum_valid;
+            }
+            if ((virtio_flags & ~checksum_policy.known_flags) != 0) packet_flags |= @as(u64, 1) << 63;
+
+            var packet_valid = true;
+            switch (decision.action) {
+                .software, .validated => {},
+                .complete_partial => {
+                    if (checksum_policy.completePartialChecksum(data, readLe16(rx_buffer, 6), readLe16(rx_buffer, 8))) {
+                        s.rx_partial_completions += 1;
+                        s.rx_software_fallbacks += 1;
+                    } else {
+                        s.rx_metadata_errors += 1;
+                        packet_valid = false;
+                    }
+                },
+                .reject_gso => {
+                    s.rx_metadata_errors += 1;
+                    packet_valid = false;
+                },
+            }
+            if (decision.metadata_fallback and decision.action != .complete_partial) s.rx_software_fallbacks += 1;
+
+            var handoff_result: i32 = r4os.abi.net_rx_handoff_invalid_frame;
+            if (packet_valid) {
+                const packet = r4os.abi.NetPacket{
+                    .flags = packet_flags,
+                    .fallback_addr = @intFromPtr(data.ptr),
+                    .fallback_bytes = @intCast(data.len),
+                    .ownership = r4os.abi.net_buffer_ownership_borrowed_until_return,
+                    .queue_index = 0,
+                    .checksum_start = readLe16(rx_buffer, 6),
+                    .checksum_offset = readLe16(rx_buffer, 8),
+                };
+                handoff_result = ctx.netReceivePacket(s.adapter_index, &packet);
+            }
             if (handoff_result == r4os.abi.net_rx_handoff_busy) {
                 s.rx_handoff_busy += 1;
                 more_work = true;
                 break;
             }
-            if (handoff_result == r4os.abi.net_rx_handoff_ok) {
+            if (handoff_result == r4os.abi.net_rx_handoff_ok or handoff_result == r4os.abi.net_rx_handoff_software_fallback) {
                 s.rx_ok += 1;
+                if (decision.action == .validated and handoff_result == r4os.abi.net_rx_handoff_ok) s.rx_offload_packets += 1;
+                if (handoff_result == r4os.abi.net_rx_handoff_software_fallback and !decision.metadata_fallback) s.rx_software_fallbacks += 1;
             } else {
                 s.bad_frames += 1;
             }
@@ -601,6 +679,11 @@ fn status(raw_context: ?*anyopaque, out: *r4os.abi.NetBackendStatus) callconv(.c
         .tx_errors = s.tx_errors,
         .rx_overflows = 0,
         .rx_recoveries = 0,
+        .offered_capabilities = if (s.guest_checksum_feature) r4os.abi.net_backend_cap_rx_l4_checksum_valid else 0,
+        .accepted_capabilities = s.accepted_capabilities,
+        .rx_offload_packets = s.rx_offload_packets,
+        .rx_software_fallbacks = s.rx_software_fallbacks,
+        .rx_metadata_errors = s.rx_metadata_errors,
     };
     return 0;
 }
@@ -749,6 +832,10 @@ fn ramRead32(off: usize) u32 {
 
 fn ramWrite16(off: usize, value: u16) void {
     @as(*volatile u16, @ptrFromInt(state.dma.virt_addr + off)).* = value;
+}
+
+fn readLe16(bytes: [*]const u8, offset: usize) u16 {
+    return @as(u16, bytes[offset]) | (@as(u16, bytes[offset + 1]) << 8);
 }
 
 // --- MMIO-Zugriffe ---
