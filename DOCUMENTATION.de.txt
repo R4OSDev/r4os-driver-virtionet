@@ -25,8 +25,9 @@ Aufbau
     zusammenhaengenden DMA-Bereich (100 KB inkl. 2-KB-Puffern).
   - Net-Header 12 Bytes (virtio 1.x, NET_HDR_LEN=12), kein MRG_RXBUF.
   - IRQ-first mit Poll-Fallback: INTx ueber interrupt_line + GSI 16-23
-    (shared, level-low), ISR-Byte read-to-clear; Drain-Guard gegen
-    parallelen IRQ-/Poll-Ring-Zugriff nach RTL8139-Muster.
+    (shared, level-low), ISR-Byte read-to-clear. Der IRQ prueft bei einer
+    Queueursache genau einmal den RX-Used-Index und weckt nur bei neuer RX-
+    Arbeit den gemeinsamen Task.
   - OPTION VIRTNET irq=off erzwingt den Poll-Fallback.
 
 Aktivierung
@@ -34,14 +35,28 @@ Aktivierung
 
 CONFIG.R4S:  DRIVER=VIRTNET
 
-Build:
+Build unter Windows:
 
-    cd Code\System\Driver\VirtioNet
-    ..\..\..\..\DevTools\Zig\zig.exe build
+    Build.bat test
+
+Build unter Linux:
+
+    ./Build.sh test
 
 Artefakt:
 
-    zig-out\VIRTNET.R4D
+    zig-out/VIRTNET.R4D
+
+RX-Handoff seit 0.69.49
+-----------------------
+
+Konfigurations- und reine TX-Interrupts quittieren nur ihren Zustand. RX-
+Ringcursor, Framekopie und Protokollverarbeitung laufen ausschliesslich im
+`net-rx`-Task. Der Task verarbeitet ein festes Treiberbudget und uebergibt
+jedes Frame genau einmal an die begrenzte Netcore-Queue. Meldet diese
+Backpressure, bleiben Used-Cursor und Deskriptorbesitz unveraendert; DriverApi
+v23 plant eine weitere ereignisgesteuerte Aktivierung. Der periodische
+10-ms-Poll dient nur als Kompatibilitaetswatchdog.
 
 Abnahme-Harness:
 

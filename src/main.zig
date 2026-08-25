@@ -12,6 +12,7 @@
 // GSI-16-23-Mitregistrierung, Poll-Fallback per OPTION VIRTNET irq=off).
 
 const r4os = @import("r4os");
+const irq_policy = @import("irq_policy.zig");
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("virtnet_init", "virtnet_shutdown"));
@@ -143,12 +144,15 @@ const State = struct {
     irq_count: u64 = 0,
     irq_handled: u64 = 0,
     irq_unhandled: u64 = 0,
-    irq_deferred: u64 = 0,
     irq_mode: u8 = 0,
 
-    // Drain-Guard: IRQ darf einen laufenden Task-Drain nicht doppeln.
-    drain_busy: bool = false,
-    drain_pending: bool = false,
+    // 0.69.49: nur der Task bewegt RX-Cursor; der IRQ klassifiziert die
+    // gemeinsame Queueursache mit genau einem Used-Index-Lesezugriff.
+    irq_rx_wakeups: u64 = 0,
+    irq_tx_only: u64 = 0,
+    irq_config: u64 = 0,
+    rx_handoff_busy: u64 = 0,
+    rx_budget_ends: u64 = 0,
 };
 
 const VirtioCap = struct {
@@ -168,6 +172,7 @@ export fn virtnet_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     state = .{ .api = api };
     poll_active = false;
     var ctx = context();
+    if (!ctx.apiCompatible()) return -10;
     ctx.logInfo("VIRTNET.R4D init");
 
     const info = findDevice(&ctx) orelse {
@@ -511,27 +516,33 @@ fn poll(raw_context: ?*anyopaque) callconv(.c) void {
         s.last_isr = mmioRead8(s.isr_base);
     }
     reclaimTx(s);
-    s.drain_busy = true;
-    drainRx(s);
-    s.drain_busy = false;
-    flushDeferredDrain(s);
+    if (drainRx(s)) {
+        const ctx = context();
+        _ = ctx.netScheduleRx(s.adapter_index);
+    }
 }
 
-fn drainRx(s: *State) void {
+fn drainRx(s: *State) bool {
     var ctx = context();
     var processed: usize = 0;
     var reposted: usize = 0;
+    var more_work = false;
     while (processed < RX_DRAIN_BUDGET) : (processed += 1) {
         const used_idx = ramRead16(OFF_RX_USED + 2);
         if (s.rx_last_used == used_idx) break;
         const elem_off = OFF_RX_USED + 4 + @as(usize, s.rx_last_used % RX_RING) * 8;
         const id = ramRead32(elem_off);
         const total_len = ramRead32(elem_off + 4);
-        s.rx_last_used +%= 1;
         if (id < RX_RING and total_len > NET_HDR_LEN) {
             const frame_len: usize = @min(@as(usize, total_len) - NET_HDR_LEN, RX_BUF_SIZE - NET_HDR_LEN);
             const data: [*]const u8 = @ptrFromInt(s.dma.virt_addr + OFF_RX_BUF + @as(u64, @intCast(id)) * RX_BUF_SIZE + NET_HDR_LEN);
-            if (ctx.netReceiveFrame(s.adapter_index, data[0..frame_len]) == 0) {
+            const handoff_result = ctx.netReceiveFrame(s.adapter_index, data[0..frame_len]);
+            if (handoff_result == r4os.abi.net_rx_handoff_busy) {
+                s.rx_handoff_busy += 1;
+                more_work = true;
+                break;
+            }
+            if (handoff_result == r4os.abi.net_rx_handoff_ok) {
                 s.rx_ok += 1;
             } else {
                 s.bad_frames += 1;
@@ -539,6 +550,7 @@ fn drainRx(s: *State) void {
         } else {
             s.rx_errors += 1;
         }
+        s.rx_last_used +%= 1;
         if (id < RX_RING) {
             // Deskriptor unveraendert wiederverwenden und neu anbieten.
             ramWrite16(OFF_RX_AVAIL + 4 + @as(usize, s.rx_avail_idx % RX_RING) * 2, @intCast(id));
@@ -553,15 +565,11 @@ fn drainRx(s: *State) void {
             notifyQueue(s, s.rx_notify_addr, RX_QUEUE);
         }
     }
-}
-
-fn flushDeferredDrain(s: *State) void {
-    while (s.drain_pending) {
-        s.drain_pending = false;
-        s.drain_busy = true;
-        drainRx(s);
-        s.drain_busy = false;
+    if (!more_work and s.rx_last_used != ramRead16(OFF_RX_USED + 2)) {
+        more_work = true;
+        s.rx_budget_ends += 1;
     }
+    return more_work;
 }
 
 fn backendShutdown(raw_context: ?*anyopaque) callconv(.c) i32 {
@@ -673,15 +681,20 @@ fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
     }
     s.irq_count += 1;
     s.irq_active_route = irq;
-    if (s.drain_busy) {
-        // Task-Kontext steht mitten im Drain: Nacharbeit anmelden statt
-        // den Ring-Cursor parallel zu bewegen (RTL8139-0.56.21-Muster).
-        s.irq_deferred += 1;
-        s.drain_pending = true;
-    } else {
-        s.drain_busy = true;
-        drainRx(s);
-        s.drain_busy = false;
+    if ((isr & irq_policy.config_interrupt) != 0) s.irq_config += 1;
+    if ((isr & irq_policy.queue_interrupt) != 0) {
+        // The ISR byte does not distinguish RX from TX. The used index is
+        // device-published before the interrupt; one ordered read is the
+        // bounded device-specific classification step.
+        compilerBarrier();
+        const rx_used = ramRead16(OFF_RX_USED + 2);
+        if (irq_policy.hasRxWork(isr, s.rx_last_used, rx_used)) {
+            s.irq_rx_wakeups += 1;
+            const ctx = context();
+            _ = ctx.netScheduleRx(s.adapter_index);
+        } else {
+            s.irq_tx_only += 1;
+        }
     }
     s.irq_handled += 1;
     return r4os.abi.irq_result_handled;

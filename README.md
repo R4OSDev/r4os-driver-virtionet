@@ -4,13 +4,19 @@
 
 ## Package
 
-- Version: `0.1.1`
+- Version: `0.1.2`
 - Image target: `/R4OS/DRIVERS/VIRTNET.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+The read-to-clear interrupt handler performs one ordered RX used-index check.
+Only a queue cause with pending RX entries publishes DriverApi v23 work;
+configuration-only and TX-only interrupts do not enter the RX protocol path.
+The `net-rx` task drains descriptors and retains the current used entry while
+the bounded common queue is full.
 
 ## Build
 
