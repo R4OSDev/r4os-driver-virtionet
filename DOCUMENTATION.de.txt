@@ -45,7 +45,7 @@ Build unter Linux:
 
 Artefakt:
 
-    zig-out/VIRTNET.R4D
+    Artifacts/Modules/VirtioNet/VIRTNET.R4D (Workspace; ARTIFACTS_ROOT aus Settings.R4S)
 
 RX-Handoff seit 0.69.49
 -----------------------
@@ -77,9 +77,11 @@ Flat-Fallback; nicht ausgehandeltes GSO wird abgewiesen. Statuszaehler weisen
 Angebot/Annahme, genutzte Validierungen, Softwarefallbacks und fehlerhafte
 Metadaten aus. RX-Ringbesitz und Backpressure-Semantik bleiben unveraendert.
 
-Abnahme-Harness:
+Vorhandene Pruefquellen:
 
-    Tests/Gate/Run-VirtioNetDhcpLiveTest05636.ps1
-    (setzt ein zuvor gebautes Test-Image voraus; tauscht CONFIG.R4S/
-    AUTOEXEC.BAT temporaer, faehrt QEMU mit
-    -device virtio-net-pci,disable-legacy=on und prueft DHCP-Marker.)
+Das Repositoryziel test fuehrt src/irq_policy.zig aus. Zusaetzliche kleine
+Pruefsummen-Hosttests liegen in src/checksum_policy.zig. Im Gastsystem dienen
+NETDIAG /DRIVER und NETR4P der Handoff- beziehungsweise Protokolldiagnose;
+ein DHCP-Livenachweis benoetigt eine passend vernetzte QEMU-Umgebung.
+Der fruehere Run-VirtioNetDhcpLiveTest05636.ps1-Harness ist im aktuellen
+Workspace nicht mehr vorhanden.
