@@ -208,10 +208,10 @@ export fn virtnet_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     if (!initDevice(&ctx)) {
         // initDevice loggt die konkrete Stufe; FAILED-Status setzen.
         mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, 0x80);
-        ctx.freeDmaRegion(&state.dma);
+        _ = shutdownHardware(&ctx);
         return -5;
     }
-    state.active = true;
+    @atomicStore(bool, &state.active, true, .release);
 
     backend = .{};
     backend.version = r4os.abi.net_backend_version;
@@ -243,7 +243,7 @@ export fn virtnet_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     const adapter = ctx.registerNetBackend("virtnet", &backend);
     if (adapter < 0) {
         ctx.logError("VIRTNET.R4D register_net_backend failed");
-        shutdownHardware(&ctx);
+        _ = shutdownHardware(&ctx);
         return -6;
     }
     state.adapter_index = adapter;
@@ -267,8 +267,7 @@ export fn virtnet_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
 export fn virtnet_shutdown() callconv(.c) i32 {
     var ctx = context();
     ctx.logInfo("VIRTNET.R4D shutdown");
-    shutdownHardware(&ctx);
-    return 0;
+    return if (shutdownHardware(&ctx)) 0 else -1;
 }
 
 fn findDevice(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
@@ -351,16 +350,7 @@ fn discoverCaps(ctx: *const r4os.r4dev.DriverContext) bool {
 // MAC und optionaler Carrier-Status), Queue-Setup RX/TX, RX-Ring
 // vorfuellen, DRIVER_OK.
 fn initDevice(ctx: *const r4os.r4dev.DriverContext) bool {
-    // Reset und warten, bis das Geraet 0 meldet.
-    mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, 0);
-    var spin: usize = 0;
-    while (mmioRead8(state.common_base + COMMON_DEVICE_STATUS) != 0) : (spin += 1) {
-        if (spin > 1000) {
-            ctx.logError("VIRTNET.R4D reset timeout");
-            return false;
-        }
-        ctx.waitTicks(1);
-    }
+    if (!resetDevice(ctx)) return false;
     mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
     mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
@@ -462,7 +452,7 @@ fn setupQueue(
 
 fn transmit(raw_context: ?*anyopaque, frame: [*]const u8, len: u32) callconv(.c) i32 {
     const s = stateFrom(raw_context) orelse return 5;
-    if (!s.active or s.dma.virt_addr == 0) return 5;
+    if (!@atomicLoad(bool, &s.active, .acquire) or s.dma.virt_addr == 0) return 5;
     if (len == 0 or len > TX_BUF_SIZE - NET_HDR_LEN) return 2;
     // 0.56.37: transmit() nicht reentrant (Slot-Bitmaske + avail-idx);
     // konkurrierende Sender (net-rx-Retransmit vs. Service-Task, siehe
@@ -534,7 +524,7 @@ fn reclaimTx(s: *State) void {
 
 fn poll(raw_context: ?*anyopaque) callconv(.c) void {
     const s = stateFrom(raw_context) orelse return;
-    if (!s.active or s.dma.virt_addr == 0) return;
+    if (!@atomicLoad(bool, &s.active, .acquire) or s.dma.virt_addr == 0) return;
     if (poll_active) return;
     poll_active = true;
     defer poll_active = false;
@@ -653,14 +643,13 @@ fn drainRx(s: *State) bool {
 fn backendShutdown(raw_context: ?*anyopaque) callconv(.c) i32 {
     _ = raw_context;
     var ctx = context();
-    shutdownHardware(&ctx);
-    return 0;
+    return if (shutdownHardware(&ctx)) 0 else -1;
 }
 
 fn status(raw_context: ?*anyopaque, out: *r4os.abi.NetBackendStatus) callconv(.c) i32 {
     const s = stateFrom(raw_context) orelse return -1;
     out.* = .{
-        .link_up = if (s.active and deviceCarrierUp(s)) 1 else 0,
+        .link_up = if (@atomicLoad(bool, &s.active, .acquire) and deviceCarrierUp(s)) 1 else 0,
         .rx_packets = s.rx_ok,
         .tx_packets = s.tx_ok,
         .drops = s.bad_frames,
@@ -754,7 +743,7 @@ fn irqDisabled(ctx: *const r4os.r4dev.DriverContext) bool {
 
 fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
     const s: *State = @ptrFromInt(raw_context);
-    if (!s.active or s.dma.virt_addr == 0 or s.isr_base == 0) return 0;
+    if (!@atomicLoad(bool, &s.active, .acquire) or s.dma.virt_addr == 0 or s.isr_base == 0) return 0;
     // ISR-Byte ist read-to-clear und deassertiert INTx.
     const isr = mmioRead8(s.isr_base);
     s.last_isr = isr;
@@ -789,21 +778,40 @@ fn irqDisplayLine(s: *State) u8 {
     return s.info.interrupt_line;
 }
 
-fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) void {
-    if (state.common_base != 0) {
-        mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, 0);
+fn resetDevice(ctx: *const r4os.r4dev.DriverContext) bool {
+    if (state.common_base == 0) return state.dma.phys_addr == 0;
+    mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, 0);
+    var waits: usize = 0;
+    while (mmioRead8(state.common_base + COMMON_DEVICE_STATUS) != 0) {
+        if (waits == 1000) {
+            ctx.logError("VIRTNET.R4D reset timeout; DMA retained");
+            return false;
+        }
+        ctx.waitTicks(1);
+        waits += 1;
     }
+    return true;
+}
+
+fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
+    // The owner has drained task callbacks; close IRQ admission before reset.
+    @atomicStore(bool, &state.active, false, .release);
+    if (!resetDevice(ctx)) return false;
     if (state.irq_registered) {
         var index: usize = 0;
         while (index < state.irq_route_count) : (index += 1) {
-            _ = ctx.irqUnregister(state.irq_routes[index], irqHandler, @intFromPtr(&state));
+            const route = state.irq_routes[index];
+            if (route == 0xFF) continue;
+            if (ctx.irqUnregister(route, irqHandler, @intFromPtr(&state)) != 0) return false;
+            state.irq_routes[index] = 0xFF;
         }
         state.irq_registered = false;
         state.irq_route_count = 0;
     }
     if (state.dma.phys_addr != 0) ctx.freeDmaRegion(&state.dma);
-    state.active = false;
     state.registered = false;
+    state.adapter_index = -1;
+    return true;
 }
 
 fn notifyQueue(s: *State, addr: u64, queue: u16) void {
