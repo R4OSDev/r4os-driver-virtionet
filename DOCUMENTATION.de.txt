@@ -81,7 +81,7 @@ Vorhandene Pruefquellen:
 
 Das Repositoryziel test fuehrt src/irq_policy.zig aus. Zusaetzliche kleine
 Pruefsummen-Hosttests liegen in src/checksum_policy.zig. Im Gastsystem dienen
-NETDIAG /DRIVER und NETR4P der Handoff- beziehungsweise Protokolldiagnose;
+SPECTRA CHECK NETWORK /DRIVER und NETR4P der Handoff- beziehungsweise Protokolldiagnose;
 ein DHCP-Livenachweis benoetigt eine passend vernetzte QEMU-Umgebung.
 Der fruehere Run-VirtioNetDhcpLiveTest05636.ps1-Harness ist im aktuellen
 Workspace nicht mehr vorhanden.
