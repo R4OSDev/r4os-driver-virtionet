@@ -250,8 +250,8 @@ export fn virtnet_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     state.registered = true;
     var negotiated: r4os.abi.NetBackendNegotiation = .{};
     if (ctx.netBackendQuery(adapter, &negotiated) != 0) {
-        // Registration already succeeded and NetBackend optional bits always
-        // have the v1 flat fallback. Keep the adapter alive without metadata.
+        // Registration already admitted the complete v2 descriptor. Optional
+        // metadata may use its canonical flat path; keep the adapter alive.
         ctx.logWarn("VIRTNET.R4D capability query failed, flat fallback");
         negotiated = .{};
     }
