@@ -120,7 +120,10 @@ const State = struct {
     tx_notify_addr: u64 = 0,
 
     // Ring-Zustand
+    // Poll's TX reclaim shares the sender owner. RX has its own task owner;
+    // status acquires both without waiting before copying either cursor set.
     tx_lock: bool = false,
+    poll_lock: bool = false,
     rx_avail_idx: u16 = 0,
     rx_last_used: u16 = 0,
     tx_avail_idx: u16 = 0,
@@ -174,11 +177,9 @@ const VirtioCap = struct {
 
 var state: State = .{};
 var backend: r4os.abi.NetBackend = .{};
-var poll_active: bool = false;
 
 export fn virtnet_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     state = .{ .api = api };
-    poll_active = false;
     var ctx = context();
     if (!ctx.apiCompatible()) return -10;
     ctx.logInfo("VIRTNET.R4D init");
@@ -454,11 +455,10 @@ fn transmit(raw_context: ?*anyopaque, frame: [*]const u8, len: u32) callconv(.c)
     const s = stateFrom(raw_context) orelse return 5;
     if (!@atomicLoad(bool, &s.active, .acquire) or s.dma.virt_addr == 0) return 5;
     if (len == 0 or len > TX_BUF_SIZE - NET_HDR_LEN) return 2;
-    // 0.56.37: transmit() nicht reentrant (Slot-Bitmaske + avail-idx);
-    // konkurrierende Sender (net-rx-Retransmit vs. Service-Task, siehe
-    // RTL8139-Guard) bekommen busy(1) und pacen darauf.
+    // Poll also reclaims TX; both paths and status use this same TX admission.
+    // Contending senders retain the existing Busy/retransmit contract.
     if (@atomicRmw(bool, &s.tx_lock, .Xchg, true, .acq_rel)) {
-        s.tx_busy += 1;
+        _ = @atomicRmw(u64, &s.tx_busy, .Add, 1, .monotonic);
         return 1;
     }
     defer @atomicStore(bool, &s.tx_lock, false, .release);
@@ -474,7 +474,7 @@ fn transmit(raw_context: ?*anyopaque, frame: [*]const u8, len: u32) callconv(.c)
             slot = allocTxSlot(s);
         }
         if (slot == null) {
-            s.tx_busy += 1;
+            _ = @atomicRmw(u64, &s.tx_busy, .Add, 1, .monotonic);
             return 1;
         }
     }
@@ -525,17 +525,19 @@ fn reclaimTx(s: *State) void {
 fn poll(raw_context: ?*anyopaque) callconv(.c) void {
     const s = stateFrom(raw_context) orelse return;
     if (!@atomicLoad(bool, &s.active, .acquire) or s.dma.virt_addr == 0) return;
-    if (poll_active) return;
-    poll_active = true;
-    defer poll_active = false;
+    if (@atomicRmw(bool, &s.poll_lock, .Xchg, true, .acq_rel)) return;
+    defer @atomicStore(bool, &s.poll_lock, false, .release);
     s.poll_count += 1;
     if (!s.irq_registered) {
         // Poll-Fallback: ISR lesen, damit eine anstehende INTx-Leitung
         // deassertiert wird (Read-to-clear), dann drainen.
         s.poll_fallbacks += 1;
-        s.last_isr = mmioRead8(s.isr_base);
+        @atomicStore(u16, &s.last_isr, mmioRead8(s.isr_base), .release);
     }
-    reclaimTx(s);
+    if (!@atomicRmw(bool, &s.tx_lock, .Xchg, true, .acq_rel)) {
+        reclaimTx(s);
+        @atomicStore(bool, &s.tx_lock, false, .release);
+    }
     if (drainRx(s)) {
         const ctx = context();
         _ = ctx.netScheduleRx(s.adapter_index);
@@ -618,7 +620,7 @@ fn drainRx(s: *State) bool {
         } else {
             s.rx_errors += 1;
         }
-        s.rx_last_used +%= 1;
+        @atomicStore(u16, &s.rx_last_used, s.rx_last_used +% 1, .release);
         if (id < RX_RING) {
             // Deskriptor unveraendert wiederverwenden und neu anbieten.
             ramWrite16(OFF_RX_AVAIL + 4 + @as(usize, s.rx_avail_idx % RX_RING) * 2, @intCast(id));
@@ -648,6 +650,10 @@ fn backendShutdown(raw_context: ?*anyopaque) callconv(.c) i32 {
 
 fn status(raw_context: ?*anyopaque, out: *r4os.abi.NetBackendStatus) callconv(.c) i32 {
     const s = stateFrom(raw_context) orelse return -1;
+    if (@atomicRmw(bool, &s.poll_lock, .Xchg, true, .acq_rel)) return -2;
+    defer @atomicStore(bool, &s.poll_lock, false, .release);
+    if (@atomicRmw(bool, &s.tx_lock, .Xchg, true, .acq_rel)) return -2;
+    defer @atomicStore(bool, &s.tx_lock, false, .release);
     out.* = .{
         .link_up = if (@atomicLoad(bool, &s.active, .acquire) and deviceCarrierUp(s)) 1 else 0,
         .rx_packets = s.rx_ok,
@@ -658,12 +664,12 @@ fn status(raw_context: ?*anyopaque, out: *r4os.abi.NetBackendStatus) callconv(.c
         .irq_pin = s.info.interrupt_pin,
         .irq_registered = if (s.irq_registered) 1 else 0,
         .irq_mode = s.irq_mode,
-        .irq_count = s.irq_count,
-        .irq_handled = s.irq_handled,
+        .irq_count = @atomicLoad(u64, &s.irq_count, .acquire),
+        .irq_handled = @atomicLoad(u64, &s.irq_handled, .acquire),
         .poll_count = s.poll_count,
         .poll_fallbacks = s.poll_fallbacks,
-        .last_isr = s.last_isr,
-        .reserved = @truncate(s.notify_kicks),
+        .last_isr = @atomicLoad(u16, &s.last_isr, .acquire),
+        .reserved = @truncate(@atomicLoad(u64, &s.notify_kicks, .acquire)),
         .rx_errors = s.rx_errors,
         .tx_errors = s.tx_errors,
         .rx_overflows = 0,
@@ -746,34 +752,35 @@ fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
     if (!@atomicLoad(bool, &s.active, .acquire) or s.dma.virt_addr == 0 or s.isr_base == 0) return 0;
     // ISR-Byte ist read-to-clear und deassertiert INTx.
     const isr = mmioRead8(s.isr_base);
-    s.last_isr = isr;
+    @atomicStore(u16, &s.last_isr, isr, .release);
     if (isr == 0) {
-        s.irq_unhandled += 1;
+        _ = @atomicRmw(u64, &s.irq_unhandled, .Add, 1, .monotonic);
         return 0;
     }
-    s.irq_count += 1;
-    s.irq_active_route = irq;
-    if ((isr & irq_policy.config_interrupt) != 0) s.irq_config += 1;
+    _ = @atomicRmw(u64, &s.irq_count, .Add, 1, .monotonic);
+    @atomicStore(u8, &s.irq_active_route, irq, .release);
+    if ((isr & irq_policy.config_interrupt) != 0) _ = @atomicRmw(u64, &s.irq_config, .Add, 1, .monotonic);
     if ((isr & irq_policy.queue_interrupt) != 0) {
         // The ISR byte does not distinguish RX from TX. The used index is
         // device-published before the interrupt; one ordered read is the
         // bounded device-specific classification step.
         compilerBarrier();
         const rx_used = ramRead16(OFF_RX_USED + 2);
-        if (irq_policy.hasRxWork(isr, s.rx_last_used, rx_used)) {
-            s.irq_rx_wakeups += 1;
+        if (irq_policy.hasRxWork(isr, @atomicLoad(u16, &s.rx_last_used, .acquire), rx_used)) {
+            _ = @atomicRmw(u64, &s.irq_rx_wakeups, .Add, 1, .monotonic);
             const ctx = context();
             _ = ctx.netScheduleRx(s.adapter_index);
         } else {
-            s.irq_tx_only += 1;
+            _ = @atomicRmw(u64, &s.irq_tx_only, .Add, 1, .monotonic);
         }
     }
-    s.irq_handled += 1;
+    _ = @atomicRmw(u64, &s.irq_handled, .Add, 1, .monotonic);
     return r4os.abi.irq_result_handled;
 }
 
 fn irqDisplayLine(s: *State) u8 {
-    if (s.irq_active_route != 0xFF) return s.irq_active_route;
+    const active_route = @atomicLoad(u8, &s.irq_active_route, .acquire);
+    if (active_route != 0xFF) return active_route;
     if (s.irq_route_count > 0) return s.irq_routes[0];
     return s.info.interrupt_line;
 }
@@ -817,7 +824,7 @@ fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
 fn notifyQueue(s: *State, addr: u64, queue: u16) void {
     if (addr == 0) return;
     @as(*volatile u16, @ptrFromInt(addr)).* = queue;
-    s.notify_kicks += 1;
+    _ = @atomicRmw(u64, &s.notify_kicks, .Add, 1, .monotonic);
 }
 
 // --- Deskriptor-/Ring-Zugriffe (DMA-RAM, volatile gegen Reordering) ---
