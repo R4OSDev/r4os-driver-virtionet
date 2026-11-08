@@ -60,6 +60,8 @@ const STATUS_FEATURES_OK: u8 = 8;
 const FEATURE_W0_NET_MAC: u32 = 1 << 5;
 const FEATURE_W0_NET_GUEST_CSUM: u32 = 1 << 1;
 const FEATURE_W0_NET_STATUS: u32 = 1 << 16;
+const FEATURE_W0_NET_CTRL_VQ: u32 = 1 << 17;
+const FEATURE_W0_NET_CTRL_RX: u32 = 1 << 18;
 const FEATURE_W1_VERSION_1: u32 = 1 << 0;
 const NET_CONFIG_STATUS: u64 = 6;
 const NET_STATUS_LINK_UP: u16 = 1;
@@ -73,6 +75,7 @@ const NET_HDR_LEN: usize = 12;
 
 const RX_QUEUE: u16 = 0;
 const TX_QUEUE: u16 = 1;
+const CONTROL_QUEUE: u16 = 2; // MQ is not negotiated: exactly one RX/TX pair.
 // Ringgroessen (Zweierpotenzen, kleiner als das QEMU-Default 256, per
 // queue_size-Write reduziert): 32 RX-Puffer reichen fuer die ~10-ms-
 // Poll-Raster des net-rx-Tasks plus IRQ-Drain; 16 TX-Slots entsprechen
@@ -89,6 +92,11 @@ const OFF_RX_USED: usize = 0x0400; // 4 + 32*8 + 2 = 262
 const OFF_TX_DESC: usize = 0x0800; // 16*16 = 256
 const OFF_TX_AVAIL: usize = 0x0A00;
 const OFF_TX_USED: usize = 0x0C00;
+// Optional control queue occupies the original unused gap before RX buffers.
+const OFF_CONTROL_DESC: usize = 0x0D00;
+const OFF_CONTROL_AVAIL: usize = 0x0D40;
+const OFF_CONTROL_USED: usize = 0x0D80;
+const OFF_CONTROL_COMMAND: usize = 0x0E00;
 const OFF_RX_BUF: usize = 0x1000; // 32*2048 = 64 KB
 const OFF_TX_BUF: usize = 0x11000; // 16*2048 = 32 KB
 const DMA_BYTES: u32 = 0x19000; // 100 KB
@@ -106,6 +114,8 @@ const State = struct {
     mac: [6]u8 = .{0} ** 6,
     link_status_feature: bool = false,
     guest_checksum_feature: bool = false,
+    control_rx_feature: bool = false,
+    multicast_ready: bool = false,
     accepted_capabilities: u64 = 0,
 
     // Gemappte BAR-Regionen (Index = BAR-Nummer)
@@ -118,6 +128,7 @@ const State = struct {
     notify_multiplier: u32 = 0,
     rx_notify_addr: u64 = 0,
     tx_notify_addr: u64 = 0,
+    control_notify_addr: u64 = 0,
 
     // Ring-Zustand
     // Poll's TX reclaim shares the sender owner. RX has its own task owner;
@@ -232,7 +243,7 @@ export fn virtnet_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     backend.poll = poll;
     backend.shutdown = backendShutdown;
     backend.status = status;
-    backend.offered_capabilities = if (state.guest_checksum_feature) r4os.abi.net_backend_cap_rx_l4_checksum_valid else 0;
+    backend.offered_capabilities = offeredCapabilities(&state);
     backend.required_capabilities = 0;
     backend.rx_queue_count = 1;
     backend.tx_queue_count = 1;
@@ -369,9 +380,11 @@ fn initDevice(ctx: *const r4os.r4dev.DriverContext) bool {
     }
     state.link_status_feature = (feat0 & FEATURE_W0_NET_STATUS) != 0;
     state.guest_checksum_feature = (feat0 & FEATURE_W0_NET_GUEST_CSUM) != 0;
+    state.control_rx_feature = (feat0 & (FEATURE_W0_NET_CTRL_VQ | FEATURE_W0_NET_CTRL_RX)) == (FEATURE_W0_NET_CTRL_VQ | FEATURE_W0_NET_CTRL_RX);
     const driver_feat0 = FEATURE_W0_NET_MAC |
         (if (state.link_status_feature) FEATURE_W0_NET_STATUS else 0) |
-        (if (state.guest_checksum_feature) FEATURE_W0_NET_GUEST_CSUM else 0);
+        (if (state.guest_checksum_feature) FEATURE_W0_NET_GUEST_CSUM else 0) |
+        (if (state.control_rx_feature) FEATURE_W0_NET_CTRL_VQ | FEATURE_W0_NET_CTRL_RX else 0);
     mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE_SELECT, 0);
     mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE, driver_feat0);
     mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE_SELECT, 1);
@@ -391,6 +404,9 @@ fn initDevice(ctx: *const r4os.r4dev.DriverContext) bool {
 
     if (!setupQueue(ctx, RX_QUEUE, RX_RING, OFF_RX_DESC, OFF_RX_AVAIL, OFF_RX_USED, &state.rx_notify_addr)) return false;
     if (!setupQueue(ctx, TX_QUEUE, TX_RING, OFF_TX_DESC, OFF_TX_AVAIL, OFF_TX_USED, &state.tx_notify_addr)) return false;
+    if (state.control_rx_feature) {
+        if (num_queues < 3 or !setupQueue(ctx, CONTROL_QUEUE, 4, OFF_CONTROL_DESC, OFF_CONTROL_AVAIL, OFF_CONTROL_USED, &state.control_notify_addr)) return false;
+    }
 
     // MAC aus dem Device-Config-Fenster (nach FEATURES_OK gueltig).
     var i: usize = 0;
@@ -409,7 +425,45 @@ fn initDevice(ctx: *const r4os.r4dev.DriverContext) bool {
 
     mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
     notifyQueue(&state, state.rx_notify_addr, RX_QUEUE);
+    // A feature bit alone does not qualify multicast reception. Advertise
+    // it only after the device acknowledges the actual ALLMULTI command.
+    if (state.control_rx_feature) state.multicast_ready = enableMulticast(ctx);
     return true;
+}
+
+fn offeredCapabilities(s: *const State) u64 {
+    return (if (s.guest_checksum_feature) r4os.abi.net_backend_cap_rx_l4_checksum_valid else @as(u64, 0)) |
+        (if (s.multicast_ready) r4os.abi.net_backend_cap_rx_multicast else @as(u64, 0));
+}
+fn enableMulticast(ctx: *const r4os.r4dev.DriverContext) bool {
+    const command: [*]volatile u8 = @ptrFromInt(state.dma.virt_addr + OFF_CONTROL_COMMAND);
+    command[0] = 0; // VIRTIO_NET_CTRL_RX
+    command[1] = 1; // VIRTIO_NET_CTRL_RX_ALLMULTI
+    command[2] = 1; // enable
+    command[3] = 0xff; // device-owned acknowledgement
+    writeDesc(OFF_CONTROL_DESC, 0, state.dma.phys_addr + OFF_CONTROL_COMMAND, 3, 1);
+    ramWrite16(OFF_CONTROL_DESC + 14, 1); // NEXT -> writable ack descriptor
+    writeDesc(OFF_CONTROL_DESC, 1, state.dma.phys_addr + OFF_CONTROL_COMMAND + 3, 1, VIRTQ_DESC_F_WRITE);
+    ramWrite16(OFF_CONTROL_AVAIL + 4, 0);
+    compilerBarrier();
+    ramWrite16(OFF_CONTROL_AVAIL + 2, 1);
+    compilerBarrier();
+    notifyQueue(&state, state.control_notify_addr, CONTROL_QUEUE);
+    var waits: usize = 0;
+    while (ramRead16(OFF_CONTROL_USED + 2) == 0) {
+        if (waits == 100) {
+            // DMA remains resident until the original acknowledged reset.
+            // IPv4 can continue, but this NIC does not acquire IPv6 readiness.
+            ctx.logWarn("VIRTNET.R4D ALLMULTI timeout; multicast unavailable");
+            return false;
+        }
+        ctx.waitTicks(1);
+        waits += 1;
+    }
+    compilerBarrier();
+    const ok = ramRead16(OFF_CONTROL_USED + 2) == 1 and ramRead32(OFF_CONTROL_USED + 4) == 0 and ramRead32(OFF_CONTROL_USED + 8) >= 1 and command[3] == 0;
+    if (ok) ctx.logInfo("VIRTNET.R4D ALLMULTI acknowledged") else ctx.logWarn("VIRTNET.R4D ALLMULTI rejected; multicast unavailable");
+    return ok;
 }
 
 fn setupQueue(
@@ -674,7 +728,7 @@ fn status(raw_context: ?*anyopaque, out: *r4os.abi.NetBackendStatus) callconv(.c
         .tx_errors = s.tx_errors,
         .rx_overflows = 0,
         .rx_recoveries = 0,
-        .offered_capabilities = if (s.guest_checksum_feature) r4os.abi.net_backend_cap_rx_l4_checksum_valid else 0,
+        .offered_capabilities = offeredCapabilities(s),
         .accepted_capabilities = s.accepted_capabilities,
         .rx_offload_packets = s.rx_offload_packets,
         .rx_software_fallbacks = s.rx_software_fallbacks,
