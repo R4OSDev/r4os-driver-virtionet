@@ -19,4 +19,7 @@ pub fn build(b: *std.Build) void {
     const run_irq_policy_tests = b.addRunArtifact(irq_policy_tests);
     const test_step = b.step("test", "Run VirtioNet IRQ cause tests");
     test_step.dependOn(&run_irq_policy_tests.step);
+    const checksum = b.createModule(.{ .root_source_file = b.path("src/checksum_policy.zig"), .target = b.graph.host, .optimize = .Debug });
+    checksum.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = checksum })).step);
 }

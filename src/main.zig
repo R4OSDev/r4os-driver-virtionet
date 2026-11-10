@@ -16,7 +16,7 @@ const checksum_policy = @import("checksum_policy.zig");
 const irq_policy = @import("irq_policy.zig");
 
 comptime {
-    asm (r4os.r4dev.driverEntriesAsm("virtnet_init", "virtnet_shutdown"));
+    if (!@import("builtin").is_test) asm (r4os.technical2.driverEntriesAsm("virtnet_init", "virtnet_shutdown"));
 }
 
 const VENDOR_VIRTIO: u16 = 0x1AF4;
@@ -105,7 +105,7 @@ const RX_DRAIN_BUDGET: usize = 64;
 const TX_RECLAIM_SPIN: usize = 400;
 
 const State = struct {
-    api: *const r4os.r4dev.DriverApi = undefined,
+    api: *const r4os.r4dev.DriverApi2 = undefined,
     active: bool = false,
     registered: bool = false,
     info: r4os.abi.PciDeviceInfo = .{},
@@ -189,10 +189,10 @@ const VirtioCap = struct {
 var state: State = .{};
 var backend: r4os.abi.NetBackend = .{};
 
-export fn virtnet_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
+export fn virtnet_init(api: *const r4os.r4dev.DriverApi2) callconv(.c) i32 {
     state = .{ .api = api };
     var ctx = context();
-    if (!ctx.apiCompatible()) return -10;
+    if (!ctx.requires(.{ "get_option", "alloc_dma_region", "free_dma_region", "irq_register", "irq_unregister", "net_backend_query", "net_receive_packet", "net_schedule_rx", "pci_device_at", "pci_device_count", "pci_enable_bus_master", "pci_map_bar", "pci_read_config32", "register_net_backend", "wait_ticks" })) return -10;
     ctx.logInfo("VIRTNET.R4D init");
 
     const info = findDevice(&ctx) orelse {
@@ -282,7 +282,7 @@ export fn virtnet_shutdown() callconv(.c) i32 {
     return if (shutdownHardware(&ctx)) 0 else -1;
 }
 
-fn findDevice(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
+fn findDevice(ctx: *const r4os.r4dev.DriverContext2) ?r4os.abi.PciDeviceInfo {
     var index: u32 = 0;
     const total = ctx.pciDeviceCount();
     while (index < total) : (index += 1) {
@@ -294,7 +294,7 @@ fn findDevice(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
     return null;
 }
 
-fn cfgByte(ctx: *const r4os.r4dev.DriverContext, offset: u16) u8 {
+fn cfgByte(ctx: *const r4os.r4dev.DriverContext2, offset: u16) u8 {
     const dword = ctx.pciReadConfig32(state.info, offset & 0xFFFC);
     const shift: u5 = @intCast((offset & 3) * 8);
     return @truncate(dword >> shift);
@@ -302,7 +302,7 @@ fn cfgByte(ctx: *const r4os.r4dev.DriverContext, offset: u16) u8 {
 
 // Vendor-Capabilities (ID 0x09) einsammeln und die referenzierten BARs
 // mappen. Liefert false, wenn kein Common-Config-Fenster existiert.
-fn discoverCaps(ctx: *const r4os.r4dev.DriverContext) bool {
+fn discoverCaps(ctx: *const r4os.r4dev.DriverContext2) bool {
     const status_cmd = ctx.pciReadConfig32(state.info, PCI_REG_STATUS_COMMAND);
     if ((status_cmd & PCI_STATUS_CAP_LIST) == 0) return false;
 
@@ -361,7 +361,7 @@ fn discoverCaps(ctx: *const r4os.r4dev.DriverContext) bool {
 // virtio-1.x-Initialisierung: Reset, Feature-Negotiation (VERSION_1 +
 // MAC und optionaler Carrier-Status), Queue-Setup RX/TX, RX-Ring
 // vorfuellen, DRIVER_OK.
-fn initDevice(ctx: *const r4os.r4dev.DriverContext) bool {
+fn initDevice(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (!resetDevice(ctx)) return false;
     mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
     mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
@@ -435,7 +435,7 @@ fn offeredCapabilities(s: *const State) u64 {
     return (if (s.guest_checksum_feature) r4os.abi.net_backend_cap_rx_l4_checksum_valid else @as(u64, 0)) |
         (if (s.multicast_ready) r4os.abi.net_backend_cap_rx_multicast else @as(u64, 0));
 }
-fn enableMulticast(ctx: *const r4os.r4dev.DriverContext) bool {
+fn enableMulticast(ctx: *const r4os.r4dev.DriverContext2) bool {
     const command: [*]volatile u8 = @ptrFromInt(state.dma.virt_addr + OFF_CONTROL_COMMAND);
     command[0] = 0; // VIRTIO_NET_CTRL_RX
     command[1] = 1; // VIRTIO_NET_CTRL_RX_ALLMULTI
@@ -449,16 +449,15 @@ fn enableMulticast(ctx: *const r4os.r4dev.DriverContext) bool {
     ramWrite16(OFF_CONTROL_AVAIL + 2, 1);
     compilerBarrier();
     notifyQueue(&state, state.control_notify_addr, CONTROL_QUEUE);
-    var waits: usize = 0;
+    var budget = r4os.driver_poll_budget.DriverPollBudget.initIterations(100, .task);
     while (ramRead16(OFF_CONTROL_USED + 2) == 0) {
-        if (waits == 100) {
+        if (budget.step(null, false) != .proceed) {
             // DMA remains resident until the original acknowledged reset.
             // IPv4 can continue, but this NIC does not acquire IPv6 readiness.
             ctx.logWarn("VIRTNET.R4D ALLMULTI timeout; multicast unavailable");
             return false;
         }
         ctx.waitTicks(1);
-        waits += 1;
     }
     compilerBarrier();
     const ok = ramRead16(OFF_CONTROL_USED + 2) == 1 and ramRead32(OFF_CONTROL_USED + 4) == 0 and ramRead32(OFF_CONTROL_USED + 8) >= 1 and command[3] == 0;
@@ -467,7 +466,7 @@ fn enableMulticast(ctx: *const r4os.r4dev.DriverContext) bool {
 }
 
 fn setupQueue(
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: *const r4os.r4dev.DriverContext2,
     queue: u16,
     ring_size: u16,
     off_desc: usize,
@@ -745,7 +744,7 @@ fn deviceCarrierUp(s: *const State) bool {
     return (mmioRead16(s.device_base + NET_CONFIG_STATUS) & NET_STATUS_LINK_UP) != 0;
 }
 
-fn setupInterrupt(ctx: *const r4os.r4dev.DriverContext) void {
+fn setupInterrupt(ctx: *const r4os.r4dev.DriverContext2) void {
     state.irq_mode = 0;
     state.irq_registered = false;
     state.irq_register_result = 0;
@@ -782,7 +781,7 @@ fn setupInterrupt(ctx: *const r4os.r4dev.DriverContext) void {
     }
 }
 
-fn registerIrqRoute(ctx: *const r4os.r4dev.DriverContext, route: u8) bool {
+fn registerIrqRoute(ctx: *const r4os.r4dev.DriverContext2, route: u8) bool {
     if (route >= 32 or state.irq_route_count >= state.irq_routes.len) return false;
     var index: usize = 0;
     while (index < state.irq_route_count) : (index += 1) {
@@ -796,7 +795,7 @@ fn registerIrqRoute(ctx: *const r4os.r4dev.DriverContext, route: u8) bool {
     return true;
 }
 
-fn irqDisabled(ctx: *const r4os.r4dev.DriverContext) bool {
+fn irqDisabled(ctx: *const r4os.r4dev.DriverContext2) bool {
     const value = ctx.getOption("VIRTNET", "irq");
     return zEqIgnoreCase(value, "off") or zEqIgnoreCase(value, "disabled") or zEqIgnoreCase(value, "0");
 }
@@ -839,22 +838,21 @@ fn irqDisplayLine(s: *State) u8 {
     return s.info.interrupt_line;
 }
 
-fn resetDevice(ctx: *const r4os.r4dev.DriverContext) bool {
+fn resetDevice(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (state.common_base == 0) return state.dma.phys_addr == 0;
     mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, 0);
-    var waits: usize = 0;
+    var budget = r4os.driver_poll_budget.DriverPollBudget.initIterations(1000, .task);
     while (mmioRead8(state.common_base + COMMON_DEVICE_STATUS) != 0) {
-        if (waits == 1000) {
+        if (budget.step(null, false) != .proceed) {
             ctx.logError("VIRTNET.R4D reset timeout; DMA retained");
             return false;
         }
         ctx.waitTicks(1);
-        waits += 1;
     }
     return true;
 }
 
-fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
+fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext2) bool {
     // The owner has drained task callbacks; close IRQ admission before reset.
     @atomicStore(bool, &state.active, false, .release);
     if (!resetDevice(ctx)) return false;
@@ -949,8 +947,8 @@ fn stateFrom(raw_context: ?*anyopaque) ?*State {
     return @ptrCast(@alignCast(ptr));
 }
 
-fn context() r4os.r4dev.DriverContext {
-    return r4os.r4dev.DriverContext.init(state.api);
+fn context() r4os.r4dev.DriverContext2 {
+    return r4os.r4dev.DriverContext2.init(state.api);
 }
 
 fn zEqIgnoreCase(value: [*:0]const u8, text: []const u8) bool {
