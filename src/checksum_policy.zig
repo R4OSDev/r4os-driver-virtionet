@@ -80,6 +80,19 @@ pub fn completePartialChecksum(frame: []u8, checksum_start: u16, checksum_offset
     return true;
 }
 
+/// The driver retains this header and frame when handoff returns Busy.
+/// Mark software completion in that same header, so a retry cannot fold the
+/// completed checksum again or promote an old DATA_VALID bit to a HW bypass.
+/// No pending work also returns true; ordinary software verification remains
+/// the receiver's responsibility. A rejected completion changes neither flags
+/// nor frame bytes.
+pub fn completePendingChecksum(frame: []u8, header_flags: *u8, checksum_start: u16, checksum_offset: u16) bool {
+    if ((header_flags.* & flag_needs_checksum) == 0) return true;
+    if (!completePartialChecksum(frame, checksum_start, checksum_offset)) return false;
+    header_flags.* &= ~(flag_needs_checksum | flag_data_valid);
+    return true;
+}
+
 fn readBe16(bytes: []const u8, offset: usize) u16 {
     return (@as(u16, bytes[offset]) << 8) | bytes[offset + 1];
 }
@@ -179,4 +192,73 @@ test "partial checksum rejects a TCP header beyond the packet without mutation" 
     const original = frame;
     try std.testing.expect(!completePartialChecksum(&frame, 34, 16));
     try std.testing.expectEqualSlices(u8, &original, &frame);
+}
+
+fn busyUdpFixture() [46]u8 {
+    var frame = [_]u8{0} ** 46;
+    frame[12] = 8;
+    frame[14] = 0x45;
+    writeBe16(&frame, 16, 32);
+    frame[23] = 17;
+    @memcpy(frame[26..34], &[_]u8{ 192, 0, 2, 1, 192, 0, 2, 2 });
+    writeBe16(&frame, 34, 1234);
+    writeBe16(&frame, 36, 4321);
+    writeBe16(&frame, 38, 12);
+    writeBe16(&frame, 40, 0x8421);
+    @memcpy(frame[42..46], "R4OS");
+    return frame;
+}
+
+test "retained receive entry completes once across Busy then Ok without a HW promotion" {
+    const std = @import("std");
+    const Receiver = struct {
+        calls: usize = 0,
+        delivered: [46]u8 = undefined,
+        const Result = enum { busy, ok };
+
+        fn offer(self: *@This(), frame: *const [46]u8) Result {
+            self.calls += 1;
+            if (self.calls == 1) return .busy;
+            self.delivered = frame.*;
+            return .ok;
+        }
+    };
+    for ([_]u8{ flag_needs_checksum, flag_needs_checksum | flag_data_valid, flag_needs_checksum | 0x80 }) |initial_flags| {
+        var frame = busyUdpFixture();
+        var flags = initial_flags;
+        var receiver = Receiver{};
+        var first: [46]u8 = undefined;
+        var completions: usize = 0;
+        for (0..2) |attempt| {
+            const decision = decide(flags, gso_none, true);
+            if (decision.action == .complete_partial) {
+                try std.testing.expect(completePendingChecksum(&frame, &flags, 34, 6));
+                completions += 1;
+            }
+            // Frozen checksum for this pseudo-header, UDP header and payload.
+            try std.testing.expectEqual(@as(u16, 0xc497), readBe16(&frame, 40));
+            const result = receiver.offer(&frame);
+            if (attempt == 0) {
+                try std.testing.expectEqual(Receiver.Result.busy, result);
+                first = frame;
+            } else {
+                try std.testing.expectEqual(Receiver.Result.ok, result);
+                try std.testing.expectEqual(Action.software, decision.action);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), receiver.calls);
+        try std.testing.expectEqual(@as(usize, 1), completions);
+        try std.testing.expectEqualSlices(u8, &first, &receiver.delivered);
+        try std.testing.expectEqual(initial_flags & ~(flag_needs_checksum | flag_data_valid), flags);
+        var verify: u32 = 0x8421;
+        var offset: usize = 34;
+        while (offset < receiver.delivered.len) : (offset += 2) verify += readBe16(&receiver.delivered, offset);
+        try std.testing.expectEqual(@as(u16, 0xffff), folded(verify));
+    }
+    var rejected = busyUdpFixture();
+    const original = rejected;
+    var flags: u8 = flag_needs_checksum | flag_data_valid;
+    try std.testing.expect(!completePendingChecksum(&rejected, &flags, 34, 16));
+    try std.testing.expectEqualSlices(u8, &original, &rejected);
+    try std.testing.expectEqual(flag_needs_checksum | flag_data_valid, flags);
 }

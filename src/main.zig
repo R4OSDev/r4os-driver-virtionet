@@ -630,7 +630,7 @@ fn drainRx(s: *State) bool {
             switch (decision.action) {
                 .software, .validated => {},
                 .complete_partial => {
-                    if (checksum_policy.completePartialChecksum(data, readLe16(rx_buffer, 6), readLe16(rx_buffer, 8))) {
+                    if (checksum_policy.completePendingChecksum(data, &rx_buffer[0], readLe16(rx_buffer, 6), readLe16(rx_buffer, 8))) {
                         s.rx_partial_completions += 1;
                         s.rx_software_fallbacks += 1;
                     } else {
