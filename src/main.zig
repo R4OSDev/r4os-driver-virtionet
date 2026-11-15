@@ -91,6 +91,7 @@ const OFF_RX_AVAIL: usize = 0x0200; // 4 + 32*2 + 2 = 70
 const OFF_RX_USED: usize = 0x0400; // 4 + 32*8 + 2 = 262
 const OFF_TX_DESC: usize = 0x0800; // 16*16 = 256
 const OFF_TX_AVAIL: usize = 0x0A00;
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 const OFF_TX_USED: usize = 0x0C00;
 // Optional control queue occupies the original unused gap before RX buffers.
 const OFF_CONTROL_DESC: usize = 0x0D00;
@@ -500,6 +501,10 @@ fn setupQueue(
     const notify_off = mmioRead16(state.common_base + COMMON_QUEUE_NOTIFY_OFF);
     notify_addr.* = state.notify_base + @as(u64, notify_off) * state.notify_multiplier;
 
+    // TX completion is reclaimed from the used ring by transmit(). It does
+    // not need an IRQ; RX and control queue notification stay enabled.
+    // EVENT_IDX is not negotiated, so the split-ring flags control this.
+    ramWrite16(off_avail, if (queue == TX_QUEUE) VIRTQ_AVAIL_F_NO_INTERRUPT else 0);
     mmioWrite16(state.common_base + COMMON_QUEUE_ENABLE, 1);
     return true;
 }

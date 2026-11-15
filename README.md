@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.7`
+- Version: `0.1.9`
 - Image target: `/R4OS/DRIVERS/VIRTNET.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -17,6 +17,12 @@ Only a queue cause with pending RX entries publishes DriverApi2 work;
 configuration-only and TX-only interrupts do not enter the RX protocol path.
 The `net-rx` task drains descriptors and retains the current used entry while
 the bounded common queue is full.
+
+The TX split ring sets `VIRTQ_AVAIL_F_NO_INTERRUPT` before queue enable;
+`EVENT_IDX` is not negotiated. TX reclaim remains lazy in the sender. RX and
+control queue interrupts retain their existing behavior. Successful partial
+checksum completion clears the retained RX header's pending/validation flags,
+so a Busy retry delivers the same software-verifiable completed bytes once.
 
 NetBackend v2 offers RX L4 checksum validation only when the virtio device
 accepted `VIRTIO_NET_F_GUEST_CSUM`. DriverApi2 confirms the selection.
