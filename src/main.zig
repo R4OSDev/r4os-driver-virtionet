@@ -522,21 +522,14 @@ fn transmit(raw_context: ?*anyopaque, frame: [*]const u8, len: u32) callconv(.c)
     defer @atomicStore(bool, &s.tx_lock, false, .release);
 
     reclaimTx(s);
-    var slot = allocTxSlot(s);
-    if (slot == null) {
-        // Kurz nachfassen (QEMU raeumt TX praktisch synchron ab), sonst
-        // busy an den Aufrufer - TCP paced per Retransmit.
-        var spin: usize = 0;
-        while (spin < TX_RECLAIM_SPIN and slot == null) : (spin += 1) {
-            reclaimTx(s);
-            slot = allocTxSlot(s);
-        }
-        if (slot == null) {
-            _ = @atomicRmw(u64, &s.tx_busy, .Add, 1, .monotonic);
-            return 1;
-        }
+    var spin: usize = 0;
+    while (s.tx_free_mask == 0 and spin < TX_RECLAIM_SPIN) : (spin += 1) {
+        reclaimTx(s);
     }
-    const slot_index = slot.?;
+    const slot_index = allocTxSlot(s) orelse {
+        _ = @atomicRmw(u64, &s.tx_busy, .Add, 1, .monotonic);
+        return 1;
+    };
 
     const buf: [*]u8 = @ptrFromInt(s.dma.virt_addr + OFF_TX_BUF + @as(u64, slot_index) * TX_BUF_SIZE);
     var i: usize = 0;
@@ -554,15 +547,10 @@ fn transmit(raw_context: ?*anyopaque, frame: [*]const u8, len: u32) callconv(.c)
 }
 
 fn allocTxSlot(s: *State) ?u16 {
-    var slot: u16 = 0;
-    while (slot < TX_RING) : (slot += 1) {
-        const bit = @as(u32, 1) << @intCast(slot);
-        if ((s.tx_free_mask & bit) != 0) {
-            s.tx_free_mask &= ~bit;
-            return slot;
-        }
-    }
-    return null;
+    const free = s.tx_free_mask;
+    if (free == 0) return null;
+    s.tx_free_mask = free & (free - 1);
+    return @intCast(@ctz(free));
 }
 
 fn reclaimTx(s: *State) void {
