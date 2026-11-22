@@ -113,6 +113,9 @@ const State = struct {
     dma: r4os.abi.DmaBuffer = .{},
     adapter_index: i32 = -1,
     mac: [6]u8 = .{0} ** 6,
+    media_dirty: bool = false,
+    device_config_length: u32 = 0,
+    speed_duplex: bool = false,
     link_status_feature: bool = false,
     guest_checksum_feature: bool = false,
     control_rx_feature: bool = false,
@@ -260,6 +263,7 @@ export fn virtnet_init(api: *const r4os.r4dev.DriverApi2) callconv(.c) i32 {
         return -6;
     }
     state.adapter_index = adapter;
+    publishMedia(&state);
     state.registered = true;
     var negotiated: r4os.abi.NetBackendNegotiation = .{};
     if (ctx.netBackendQuery(adapter, &negotiated) != 0) {
@@ -353,6 +357,7 @@ fn discoverCaps(ctx: *const r4os.r4dev.DriverContext2) bool {
 
     state.common_base = state.bars[caps[CAP_COMMON - 1].bar].virt_addr + caps[CAP_COMMON - 1].offset;
     state.isr_base = state.bars[caps[CAP_ISR - 1].bar].virt_addr + caps[CAP_ISR - 1].offset;
+    state.device_config_length = caps[CAP_DEVICE - 1].length;
     state.device_base = state.bars[caps[CAP_DEVICE - 1].bar].virt_addr + caps[CAP_DEVICE - 1].offset;
     state.notify_base = state.bars[caps[CAP_NOTIFY - 1].bar].virt_addr + caps[CAP_NOTIFY - 1].offset;
     state.notify_multiplier = caps[CAP_NOTIFY - 1].notify_multiplier;
@@ -379,6 +384,7 @@ fn initDevice(ctx: *const r4os.r4dev.DriverContext2) bool {
         ctx.logError("VIRTNET.R4D device does not offer MAC feature");
         return false;
     }
+    state.speed_duplex = state.device_config_length >= 17 and (feat1 & (1 << 31)) != 0;
     state.link_status_feature = (feat0 & FEATURE_W0_NET_STATUS) != 0;
     state.guest_checksum_feature = (feat0 & FEATURE_W0_NET_GUEST_CSUM) != 0;
     state.control_rx_feature = (feat0 & (FEATURE_W0_NET_CTRL_VQ | FEATURE_W0_NET_CTRL_RX)) == (FEATURE_W0_NET_CTRL_VQ | FEATURE_W0_NET_CTRL_RX);
@@ -389,7 +395,7 @@ fn initDevice(ctx: *const r4os.r4dev.DriverContext2) bool {
     mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE_SELECT, 0);
     mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE, driver_feat0);
     mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE_SELECT, 1);
-    mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE, FEATURE_W1_VERSION_1);
+    mmioWrite32(state.common_base + COMMON_DRIVER_FEATURE, FEATURE_W1_VERSION_1 | (if (state.speed_duplex) @as(u32, 1 << 31) else 0));
 
     mmioWrite8(state.common_base + COMMON_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
     if ((mmioRead8(state.common_base + COMMON_DEVICE_STATUS) & STATUS_FEATURES_OK) == 0) {
@@ -578,8 +584,11 @@ fn poll(raw_context: ?*anyopaque) callconv(.c) void {
         // Poll-Fallback: ISR lesen, damit eine anstehende INTx-Leitung
         // deassertiert wird (Read-to-clear), dann drainen.
         s.poll_fallbacks += 1;
-        @atomicStore(u16, &s.last_isr, mmioRead8(s.isr_base), .release);
+        const isr = mmioRead8(s.isr_base);
+        @atomicStore(u16, &s.last_isr, isr, .release);
+        if ((isr & irq_policy.config_interrupt) != 0) @atomicStore(bool, &s.media_dirty, true, .release);
     }
+    if (@atomicLoad(bool, &s.media_dirty, .acquire) and @atomicRmw(bool, &s.media_dirty, .Xchg, false, .acq_rel)) publishMedia(s);
     if (!@atomicRmw(bool, &s.tx_lock, .Xchg, true, .acq_rel)) {
         reclaimTx(s);
         @atomicStore(bool, &s.tx_lock, false, .release);
@@ -729,6 +738,25 @@ fn status(raw_context: ?*anyopaque, out: *r4os.abi.NetBackendStatus) callconv(.c
     return 0;
 }
 
+// virtio_net_config speed starts at byte 12 and duplex at byte 16.
+fn publishMedia(s: *State) void {
+    const ctx = context();
+    if (ctx.function("net_publish_media") == null) return;
+    for (0..3) |_| {
+        const generation = mmioRead8(s.common_base + 21);
+        const link: u8 = if (!s.link_status_feature) 0 else if (deviceCarrierUp(s)) 2 else 1;
+        const mbps = if (s.speed_duplex and link == 2) mmioRead32(s.device_base + 12) else 0;
+        const raw_duplex = if (s.speed_duplex and link == 2) mmioRead8(s.device_base + 16) else 0xff;
+        if (generation != mmioRead8(s.common_base + 21)) continue;
+        const rate = if (mbps > 0 and mbps <= 0x7fffffff) @as(u64, mbps) * 1_000_000 else 0;
+        const duplex: u8 = if (raw_duplex <= 1) raw_duplex + 1 else 0;
+        ctx.netPublishMedia(s.adapter_index, link, duplex, rate, rate);
+        return;
+    }
+    ctx.netPublishMedia(s.adapter_index, 0, 0, 0, 0);
+    @atomicStore(bool, &s.media_dirty, true, .release);
+}
+
 fn deviceCarrierUp(s: *const State) bool {
     // VIRTIO_NET_F_STATUS makes QEMU set bit 0 of virtio_net_config.status
     // for QMP set_link and real carrier changes. Older devices that do not
@@ -805,7 +833,12 @@ fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
     }
     _ = @atomicRmw(u64, &s.irq_count, .Add, 1, .monotonic);
     @atomicStore(u8, &s.irq_active_route, irq, .release);
-    if ((isr & irq_policy.config_interrupt) != 0) _ = @atomicRmw(u64, &s.irq_config, .Add, 1, .monotonic);
+    if ((isr & irq_policy.config_interrupt) != 0) {
+        _ = @atomicRmw(u64, &s.irq_config, .Add, 1, .monotonic);
+        @atomicStore(bool, &s.media_dirty, true, .release);
+        const ctx = context();
+        _ = ctx.netScheduleRx(s.adapter_index);
+    }
     if ((isr & irq_policy.queue_interrupt) != 0) {
         // The ISR byte does not distinguish RX from TX. The used index is
         // device-published before the interrupt; one ordered read is the
